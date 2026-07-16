@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://jarvis.local/schemas/protocol.schema.json",
+  "title": "JARVIS local protocol",
+  "$defs": {
+    "assistantState": {
+      "type": "string",
+      "enum": [
+        "idle",
+        "wake_word_detected",
+        "listening",
+        "transcribing",
+        "thinking",
+        "waiting_for_confirmation",
+        "executing",
+        "speaking",
+        "error"
+      ]
+    },
+    "riskLevel": { "type": "string", "enum": ["low", "medium", "high"] },
+    "permissionLevel": {
+      "type": "string",
+      "enum": ["disabled", "ask_every_time", "allow_session", "always_allow"]
+    },
+    "event": {
+      "type": "object",
+      "required": ["type", "id", "timestamp", "payload"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "status_changed",
+            "partial_transcript",
+            "final_transcript",
+            "assistant_response",
+            "tool_proposal",
+            "confirmation_request",
+            "confirmation_decision",
+            "tool_execution_result",
+            "settings_updated",
+            "cancellation",
+            "error"
+          ]
+        },
+        "id": { "type": "string", "format": "uuid" },
+        "timestamp": { "type": "string", "format": "date-time" },
+        "payload": { "type": "object" }
+      },
+      "additionalProperties": false
+    },
+    "clientMessage": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["type", "token"],
+          "properties": {
+            "type": { "const": "authenticate" },
+            "token": { "type": "string", "minLength": 32, "maxLength": 512 }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["type"],
+          "properties": {
+            "type": { "enum": ["ping", "cancel", "start_listening"] }
+          },
+          "additionalProperties": false
+        }
+      ]
+    }
+  }
+}

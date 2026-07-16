@@ -1,0 +1,5 @@
+{
+  "low": "always_allow unless the tool declares confirmation_required",
+  "medium": "ask_every_time",
+  "high": "ask_every_time; permanent automatic approval is rejected"
+}

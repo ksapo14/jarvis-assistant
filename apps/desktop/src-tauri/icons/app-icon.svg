@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="JARVIS">
+  <rect width="512" height="512" rx="112" fill="#0b1011"/>
+  <circle cx="256" cy="256" r="168" fill="#101819" stroke="#273b38" stroke-width="8"/>
+  <path d="M256 88a168 168 0 0 1 145 83" fill="none" stroke="#7ddfc7" stroke-linecap="round" stroke-width="18"/>
+  <path d="M424 256a168 168 0 0 1-83 145" fill="none" stroke="#7ddfc7" stroke-linecap="round" stroke-width="18"/>
+  <path d="M256 424a168 168 0 0 1-145-83" fill="none" stroke="#4f8f81" stroke-linecap="round" stroke-width="18"/>
+  <path d="M88 256a168 168 0 0 1 83-145" fill="none" stroke="#4f8f81" stroke-linecap="round" stroke-width="18"/>
+  <circle cx="256" cy="256" r="92" fill="#0b1011" stroke="#34564f" stroke-width="6"/>
+  <path d="M286 183v83c0 47-21 68-64 68-19 0-36-5-50-16l22-35c8 6 16 9 25 9 16 0 24-9 24-29v-80z" fill="#7ddfc7"/>
+  <circle cx="400" cy="172" r="12" fill="#e3ad64"/>
+</svg>
