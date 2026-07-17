@@ -11,11 +11,13 @@ import {
   useEffect,
   useMemo,
   useReducer,
+  useRef,
 } from "react";
 import { AssistantApi } from "@/api/client";
 import { EventSocket } from "@/api/websocket";
 import { AutostartCoordinator } from "@/autostart";
 import { mergeSettingsUpdate } from "@/settings-state";
+import { SingleFlight } from "@/single-flight";
 import type {
   ActivityRecord,
   AssistantSettings,
@@ -71,6 +73,7 @@ interface StoreState {
   history: ActivityRecord[];
   providers: ProviderStatus[];
   microphones: MicrophoneDevice[];
+  controlPending: "starting" | "stopping" | "cancelling" | null;
   loading: boolean;
   uiError: string | null;
 }
@@ -82,6 +85,10 @@ type StoreAction =
   | { type: "settings"; payload: AssistantSettings }
   | { type: "tools"; payload: ToolDefinition[] }
   | { type: "history"; payload: ActivityRecord[] }
+  | {
+      type: "control_pending";
+      payload: StoreState["controlPending"];
+    }
   | { type: "error"; payload: string | null };
 
 function reducer(state: StoreState, action: StoreAction): StoreState {
@@ -103,6 +110,22 @@ function reducer(state: StoreState, action: StoreAction): StoreState {
       return { ...state, tools: action.payload };
     case "history":
       return { ...state, history: action.payload };
+    case "control_pending":
+      return {
+        ...state,
+        controlPending: action.payload,
+        snapshot: action.payload
+          ? {
+              ...state.snapshot,
+              detail:
+                action.payload === "starting"
+                  ? "Starting the microphone…"
+                  : action.payload === "stopping"
+                    ? "Stopping listening…"
+                    : "Cancelling the current operation…",
+            }
+          : state.snapshot,
+      };
     case "error":
       return { ...state, uiError: action.payload };
     case "backend_event": {
@@ -174,6 +197,7 @@ function reducer(state: StoreState, action: StoreAction): StoreState {
       if (event.type === "cancelled") {
         return {
           ...state,
+          controlPending: null,
           confirmation: null,
           snapshot: { ...state.snapshot, state: "idle", detail: event.payload.reason },
         };
@@ -222,6 +246,7 @@ const BOOTSTRAP_RETRY_MIN_MS = 300;
 const BOOTSTRAP_RETRY_MAX_MS = 5_000;
 
 export function AssistantProvider({ children }: PropsWithChildren) {
+  const controlFlight = useRef(new SingleFlight());
   const [state, dispatch] = useReducer(reducer, {
     snapshot: initialSnapshot,
     confirmation: null,
@@ -230,6 +255,7 @@ export function AssistantProvider({ children }: PropsWithChildren) {
     history: [],
     providers: [],
     microphones: [],
+    controlPending: null,
     loading: true,
     uiError: null,
   });
@@ -327,33 +353,48 @@ export function AssistantProvider({ children }: PropsWithChildren) {
     };
   }, [report]);
 
+  const runControlAction = useCallback(
+    async (
+      pending: Exclude<StoreState["controlPending"], null>,
+      operation: () => Promise<void>,
+    ) => {
+      await controlFlight.current.run(async () => {
+        dispatch({ type: "error", payload: null });
+        dispatch({ type: "control_pending", payload: pending });
+        try {
+          await operation();
+        } catch (error) {
+          report(error);
+        } finally {
+          try {
+            const snapshot = await api.state();
+            dispatch({
+              type: "backend_event",
+              payload: { type: "snapshot", payload: snapshot },
+            });
+          } catch {
+            // The WebSocket remains authoritative if a refresh races a backend restart.
+          }
+          dispatch({ type: "control_pending", payload: null });
+        }
+      });
+    },
+    [report],
+  );
+
   const toggleListening = useCallback(async () => {
-    dispatch({ type: "error", payload: null });
-    try {
-      if (["listening", "transcribing"].includes(state.snapshot.state)) {
-        await api.stopListening();
-      } else if (state.snapshot.state === "speaking") {
-        await api.cancel();
-        await api.startListening();
-      } else {
-        await api.startListening();
-      }
-    } catch (error) {
-      report(error);
+    if (["listening", "transcribing"].includes(state.snapshot.state)) {
+      await runControlAction("stopping", () => api.stopListening());
+    } else if (state.snapshot.state === "speaking") {
+      await runControlAction("cancelling", () => api.cancel());
+    } else {
+      await runControlAction("starting", () => api.startListening());
     }
-  }, [report, state.snapshot.state]);
+  }, [runControlAction, state.snapshot.state]);
 
   const cancel = useCallback(async () => {
-    try {
-      await api.cancel();
-      dispatch({
-        type: "backend_event",
-        payload: { type: "cancelled", payload: { reason: "Operation cancelled." } },
-      });
-    } catch (error) {
-      report(error);
-    }
-  }, [report]);
+    await runControlAction("cancelling", () => api.cancel());
+  }, [runControlAction]);
 
   const sendCommand = useCallback(
     async (text: string) => {

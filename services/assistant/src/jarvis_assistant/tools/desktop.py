@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import contextlib
 import ctypes
 import hashlib
@@ -23,7 +22,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from ..cancellation import CancellationToken
 from ..models import PermissionCategory, RiskLevel, ToolCall
 from ..powershell import PowerShellRunner
-from ..process_io import launch_associated_target
+from ..process_io import launch_associated_target, run_blocking
 from .base import BaseTool, ToolExecutionError, ToolUnavailableError, ToolValidationError
 
 
@@ -156,6 +155,8 @@ class OpenApplicationTool(BaseTool):
 
     _ALIASES: ClassVar[dict[str, str]] = {
         "calculator": "calc.exe",
+        "chrome": "chrome.exe",
+        "google chrome": "chrome.exe",
         "notepad": "notepad.exe",
         "paint": "mspaint.exe",
         "file explorer": "explorer.exe",
@@ -213,8 +214,8 @@ class OpenApplicationTool(BaseTool):
         alias = (preferred_applications or {}).get(normalized) or cls._ALIASES.get(normalized)
         candidate = alias or requested
         if re.fullmatch(r"[A-Za-z0-9_.-]+\.exe", candidate):
-            resolved = shutil.which(candidate)
-            if resolved:
+            resolved = shutil.which(candidate) or cls._resolve_windows_app_path(candidate)
+            if resolved is not None:
                 path = Path(resolved).resolve(strict=False)
                 cls._require_trusted_install_path(path)
                 return str(path)
@@ -232,8 +233,61 @@ class OpenApplicationTool(BaseTool):
             for name in ("ProgramFiles", "ProgramFiles(x86)", "SystemRoot")
             if (value := os.getenv(name))
         ]
+        if local_app_data := os.getenv("LOCALAPPDATA"):
+            local_root = Path(local_app_data).resolve(strict=False)
+            roots.extend(
+                [
+                    local_root / "Programs",
+                    local_root / "Google" / "Chrome" / "Application",
+                ]
+            )
         if not any(_is_relative_to(path, root) for root in roots):
             raise ToolValidationError("application path is outside approved installation folders")
+
+    @classmethod
+    def _resolve_windows_app_path(cls, executable_name: str) -> str | None:
+        if sys.platform != "win32":
+            return None
+        registry_candidate = cls._read_app_paths_registry(executable_name)
+        if registry_candidate is not None:
+            path = Path(registry_candidate).resolve(strict=False)
+            if path.is_file() and path.suffix.casefold() == ".exe":
+                cls._require_trusted_install_path(path)
+                return str(path)
+        if executable_name.casefold() != "chrome.exe":
+            return None
+        candidates: list[Path] = []
+        for environment_name in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"):
+            if value := os.getenv(environment_name):
+                candidates.append(Path(value) / "Google" / "Chrome" / "Application" / "chrome.exe")
+        for candidate in candidates:
+            if candidate.is_file():
+                resolved = candidate.resolve(strict=True)
+                cls._require_trusted_install_path(resolved)
+                return str(resolved)
+        return None
+
+    @staticmethod
+    def _read_app_paths_registry(executable_name: str) -> str | None:
+        try:
+            import winreg
+        except ImportError:
+            return None
+        subkey = r"Software\Microsoft\Windows\CurrentVersion\App Paths" f"\\{executable_name}"
+        for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+            for access in (
+                winreg.KEY_READ,
+                winreg.KEY_READ | getattr(winreg, "KEY_WOW64_64KEY", 0),
+                winreg.KEY_READ | getattr(winreg, "KEY_WOW64_32KEY", 0),
+            ):
+                try:
+                    with winreg.OpenKey(hive, subkey, 0, access) as key:
+                        value, _kind = winreg.QueryValueEx(key, None)
+                except OSError:
+                    continue
+                if isinstance(value, str) and value.strip():
+                    return os.path.expandvars(value.strip().strip('"'))
+        return None
 
     @classmethod
     def _validated_trusted_executable(cls, executable: str) -> str:
@@ -265,7 +319,7 @@ class GetActiveWindowTool(BaseTool):
     ) -> WindowInfoResult:
         del arguments
         cancellation.raise_if_cancelled()
-        return await asyncio.to_thread(_active_window_info)
+        return await run_blocking(_active_window_info)
 
 
 class ListApplicationsArguments(StrictArguments):
@@ -324,7 +378,7 @@ class SetVolumeTool(BaseTool):
     async def execute(self, arguments: BaseModel, cancellation: CancellationToken) -> MessageResult:
         level = cast(SetVolumeArguments, arguments).level
         cancellation.raise_if_cancelled()
-        actual = await asyncio.to_thread(_set_audio_volume, level)
+        actual = await run_blocking(_set_audio_volume, level)
         if actual == level:
             return MessageResult(message=f"Windows reports master volume at {actual} percent.")
         return MessageResult(
@@ -349,7 +403,7 @@ class SetMuteTool(BaseTool):
     async def execute(self, arguments: BaseModel, cancellation: CancellationToken) -> MessageResult:
         muted = cast(SetMuteArguments, arguments).muted
         cancellation.raise_if_cancelled()
-        await asyncio.to_thread(_set_audio_muted, muted)
+        await run_blocking(_set_audio_muted, muted)
         return MessageResult(message="Muted audio." if muted else "Unmuted audio.")
 
 
@@ -367,7 +421,7 @@ class ReadClipboardTool(BaseTool):
     ) -> ClipboardResult:
         del arguments
         cancellation.raise_if_cancelled()
-        text = await asyncio.to_thread(_read_clipboard_text)
+        text = await run_blocking(_read_clipboard_text)
         return ClipboardResult(message="Read clipboard text.", text=text[:100_000])
 
     def preview(self, arguments: BaseModel) -> str:
@@ -390,7 +444,7 @@ class SetClipboardTool(BaseTool):
     async def execute(self, arguments: BaseModel, cancellation: CancellationToken) -> MessageResult:
         text = cast(SetClipboardArguments, arguments).text
         cancellation.raise_if_cancelled()
-        await asyncio.to_thread(_set_clipboard_text, text)
+        await run_blocking(_set_clipboard_text, text)
         return MessageResult(message=f"Placed {len(text)} characters on the clipboard.")
 
     def preview(self, arguments: BaseModel) -> str:
@@ -428,9 +482,9 @@ class TakeScreenshotTool(BaseTool):
             raise ToolUnavailableError("Pillow is required for screenshots") from exc
         completed = False
         try:
-            image = await asyncio.to_thread(ImageGrab.grab, all_screens=True)
+            image = await run_blocking(ImageGrab.grab, all_screens=True)
             cancellation.raise_if_cancelled()
-            await asyncio.to_thread(image.save, path, "PNG")
+            await run_blocking(image.save, path, "PNG")
             cancellation.raise_if_cancelled()
             completed = True
             return ScreenshotResult(message=f"Saved screenshot to {path}.", path=str(path))
@@ -449,16 +503,36 @@ class WindowAction(StrEnum):
     MAXIMIZE = "maximize"
     RESTORE = "restore"
     FOCUS = "focus"
+    MOVE = "move"
+    RESIZE = "resize"
+    MOVE_RESIZE = "move_resize"
 
 
 class WindowActionArguments(StrictArguments):
     title_contains: str = Field(min_length=1, max_length=300)
     action: WindowAction
+    x: int | None = Field(default=None, ge=-32_768, le=32_767)
+    y: int | None = Field(default=None, ge=-32_768, le=32_767)
+    width: int | None = Field(default=None, ge=100, le=16_384)
+    height: int | None = Field(default=None, ge=100, le=16_384)
+
+    @model_validator(mode="after")
+    def required_geometry(self) -> WindowActionArguments:
+        needs_position = self.action in {WindowAction.MOVE, WindowAction.MOVE_RESIZE}
+        needs_size = self.action in {WindowAction.RESIZE, WindowAction.MOVE_RESIZE}
+        if needs_position and (self.x is None or self.y is None):
+            raise ValueError("move actions require both x and y")
+        if needs_size and (self.width is None or self.height is None):
+            raise ValueError("resize actions require both width and height")
+        return self
 
 
 class ManageWindowTool(BaseTool):
     name = "manage_window"
-    description = "Minimize, maximize, restore, or focus a visible window by title."
+    description = (
+        "Minimize, maximize, restore, focus, move, or resize the topmost matching visible "
+        "window by title."
+    )
     permission_category = PermissionCategory.WINDOWS
     risk_level = RiskLevel.LOW
     arguments_model = WindowActionArguments
@@ -467,9 +541,7 @@ class ManageWindowTool(BaseTool):
     async def execute(self, arguments: BaseModel, cancellation: CancellationToken) -> MessageResult:
         values = cast(WindowActionArguments, arguments)
         cancellation.raise_if_cancelled()
-        title = await asyncio.to_thread(
-            _perform_window_action, values.title_contains, values.action
-        )
+        title = await run_blocking(_perform_window_action, values)
         return MessageResult(message=f"Applied {values.action.value} to {title}.")
 
 
@@ -509,8 +581,8 @@ class TypeTextTool(BaseTool):
         cancellation: CancellationToken,
     ) -> tuple[ToolCall, BaseModel]:
         cancellation.raise_if_cancelled()
-        target = await asyncio.to_thread(_get_active_window_target)
-        await asyncio.to_thread(_validate_type_text_target, target.process_id)
+        target = await run_blocking(_get_active_window_target)
+        await run_blocking(_validate_type_text_target, target.process_id)
         values = cast(TypeTextArguments, arguments).model_copy(
             update={
                 "target_window_handle": target.handle,
@@ -525,7 +597,7 @@ class TypeTextTool(BaseTool):
         text = values.text
         cancellation.raise_if_cancelled()
         target = _bound_target(values)
-        sent = await asyncio.to_thread(_set_text_via_uia_bound, text, target)
+        sent = await run_blocking(_set_text_via_uia_bound, text, target)
         if sent != len(text.encode("utf-16-le")) // 2:
             raise ToolExecutionError("Windows accepted only part of the requested keyboard input")
         return MessageResult(message=f"Typed {len(text)} characters into the active application.")
@@ -602,7 +674,7 @@ class ClickNamedControlTool(BaseTool):
         cancellation: CancellationToken,
     ) -> tuple[ToolCall, BaseModel]:
         cancellation.raise_if_cancelled()
-        target = await asyncio.to_thread(_get_active_window_target)
+        target = await run_blocking(_get_active_window_target)
         values = cast(ClickControlArguments, arguments).model_copy(
             update={
                 "target_window_handle": target.handle,
@@ -615,7 +687,7 @@ class ClickNamedControlTool(BaseTool):
     async def execute(self, arguments: BaseModel, cancellation: CancellationToken) -> MessageResult:
         values = cast(ClickControlArguments, arguments)
         cancellation.raise_if_cancelled()
-        await asyncio.to_thread(_click_named_control, values, _bound_target(values))
+        await run_blocking(_click_named_control, values, _bound_target(values))
         return MessageResult(message=f"Invoked the {values.control_name} control.")
 
     def preview(self, arguments: BaseModel) -> str:
@@ -665,7 +737,7 @@ class CloseApplicationTool(BaseTool):
     ) -> tuple[ToolCall, BaseModel]:
         cancellation.raise_if_cancelled()
         values = cast(CloseApplicationArguments, arguments)
-        identities = await asyncio.to_thread(_resolve_close_process_identities, values)
+        identities = await run_blocking(_resolve_close_process_identities, values)
         if not identities:
             raise ToolValidationError("no running application matches the requested target")
         bound = values.model_copy(
@@ -681,7 +753,7 @@ class CloseApplicationTool(BaseTool):
     async def execute(self, arguments: BaseModel, cancellation: CancellationToken) -> MessageResult:
         values = cast(CloseApplicationArguments, arguments)
         cancellation.raise_if_cancelled()
-        count = await asyncio.to_thread(_close_application_windows, values)
+        count = await run_blocking(_close_application_windows, values)
         if count == 0:
             raise ToolExecutionError("no visible windows matched the requested application")
         return MessageResult(message=f"Sent a normal close request to {count} window(s).")
@@ -730,6 +802,29 @@ def _configure_user32(user32: Any) -> None:
     user32.ShowWindow.restype = wintypes.BOOL
     user32.SetForegroundWindow.argtypes = [wintypes.HWND]
     user32.SetForegroundWindow.restype = wintypes.BOOL
+    if hasattr(user32, "BringWindowToTop"):
+        user32.BringWindowToTop.argtypes = [wintypes.HWND]
+        user32.BringWindowToTop.restype = wintypes.BOOL
+    if hasattr(user32, "GetWindowRect"):
+        user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+        user32.GetWindowRect.restype = wintypes.BOOL
+    if hasattr(user32, "IsIconic"):
+        user32.IsIconic.argtypes = [wintypes.HWND]
+        user32.IsIconic.restype = wintypes.BOOL
+    if hasattr(user32, "IsZoomed"):
+        user32.IsZoomed.argtypes = [wintypes.HWND]
+        user32.IsZoomed.restype = wintypes.BOOL
+    if hasattr(user32, "SetWindowPos"):
+        user32.SetWindowPos.argtypes = [
+            wintypes.HWND,
+            wintypes.HWND,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            wintypes.UINT,
+        ]
+        user32.SetWindowPos.restype = wintypes.BOOL
     user32.PostMessageW.argtypes = [
         wintypes.HWND,
         wintypes.UINT,
@@ -925,24 +1020,45 @@ def _find_window(title_contains: str) -> tuple[int, str]:
     user32.EnumWindows(callback, 0)
     if not matches:
         raise ToolExecutionError(f"no visible window title contains {title_contains!r}")
-    if len(matches) > 1:
-        raise ToolValidationError("multiple windows match; use a more specific title")
-    return matches[0]
+    exact_matches = [match for match in matches if match[1].strip().casefold() == needle.strip()]
+    candidates = exact_matches or matches
+    foreground = int(user32.GetForegroundWindow() or 0)
+    return next((match for match in candidates if int(match[0]) == foreground), candidates[0])
 
 
-def _perform_window_action(title_contains: str, action: WindowAction) -> str:
-    handle, title = _find_window(title_contains)
+def _perform_window_action(values: WindowActionArguments) -> str:
+    handle, title = _find_window(values.title_contains)
     user32 = ctypes.windll.user32
     _configure_user32(user32)
     commands = {WindowAction.MINIMIZE: 6, WindowAction.MAXIMIZE: 3, WindowAction.RESTORE: 9}
-    if action is WindowAction.FOCUS:
+    if values.action is WindowAction.FOCUS:
         user32.ShowWindow(handle, 9)
-        if not user32.SetForegroundWindow(handle):
+        user32.BringWindowToTop(handle)
+        focused = bool(user32.SetForegroundWindow(handle))
+        if not focused and int(user32.GetForegroundWindow() or 0) != int(handle):
             raise ToolExecutionError(
                 "Windows refused focus; elevated windows cannot be controlled by a normal process"
             )
+    elif values.action in commands:
+        user32.ShowWindow(handle, commands[values.action])
     else:
-        user32.ShowWindow(handle, commands[action])
+        from ctypes import wintypes
+
+        if user32.IsIconic(handle) or user32.IsZoomed(handle):
+            user32.ShowWindow(handle, 9)
+        rectangle = wintypes.RECT()
+        if not user32.GetWindowRect(handle, ctypes.byref(rectangle)):
+            raise ToolExecutionError("Windows could not read the current window position")
+        x = values.x if values.x is not None else int(rectangle.left)
+        y = values.y if values.y is not None else int(rectangle.top)
+        width = values.width if values.width is not None else int(rectangle.right - rectangle.left)
+        height = (
+            values.height if values.height is not None else int(rectangle.bottom - rectangle.top)
+        )
+        if not user32.SetWindowPos(handle, None, x, y, width, height, 0x0004 | 0x0010):
+            raise ToolExecutionError(
+                "Windows refused to move or resize the window; elevated windows may be protected"
+            )
     return title
 
 

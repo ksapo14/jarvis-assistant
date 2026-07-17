@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import os
 import shutil
@@ -13,7 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from ..cancellation import CancellationToken
 from ..models import PermissionCategory, RiskLevel, ToolCall
-from ..process_io import launch_associated_target
+from ..process_io import launch_associated_target, run_blocking
 from .base import BaseTool, ToolExecutionError, ToolValidationError
 from .safe_paths import PathScope
 from .windows_file_ops import (
@@ -162,7 +161,7 @@ class SearchFilesTool(BaseTool):
             if values.root
             else self._scope.roots
         )
-        return await asyncio.to_thread(self._search, roots, values, cancellation)
+        return await run_blocking(self._search, roots, values, cancellation)
 
     def _search(
         self, roots: tuple[Path, ...], values: SearchFilesArguments, cancellation: CancellationToken
@@ -239,7 +238,7 @@ class CreateFolderTool(BaseTool):
         path = self._scope.resolve(cast(CreateFolderArguments, arguments).path)
         cancellation.raise_if_cancelled()
         try:
-            await asyncio.to_thread(path.mkdir, parents=False, exist_ok=False)
+            await run_blocking(path.mkdir, parents=False, exist_ok=False)
         except FileExistsError as exc:
             raise ToolExecutionError(f"path already exists: {path}") from exc
         except OSError as exc:
@@ -305,7 +304,7 @@ class WriteTextFileTool(BaseTool):
         else:
             if not path.is_file():
                 raise ToolValidationError(f"{values.mode} requires an existing regular text file")
-            identity = await asyncio.to_thread(_path_identity, path)
+            identity = await run_blocking(_path_identity, path)
         bound = values.model_copy(update={"path": str(path), "target_identity": identity})
         return call.model_copy(update={"arguments": bound.model_dump(mode="json")}), bound
 
@@ -317,14 +316,14 @@ class WriteTextFileTool(BaseTool):
         if not path.parent.is_dir():
             raise ToolValidationError("parent directory does not exist")
         if values.mode == "create" or os.name != "nt":
-            await asyncio.to_thread(
+            await run_blocking(
                 _require_expected_identity,
                 path,
                 values.target_identity,
                 expect_absent=values.mode == "create",
             )
         cancellation.raise_if_cancelled()
-        await asyncio.to_thread(self._write, path, values)
+        await run_blocking(self._write, path, values)
         return PathResult(message=f"Wrote text to {path}.", path=str(path))
 
     @staticmethod
@@ -407,7 +406,7 @@ class MovePathTool(BaseTool):
                     source := self._scope.resolve(values.source, must_exist=True, allow_root=False)
                 ),
                 "destination": str(self._scope.resolve(values.destination, allow_root=False)),
-                "source_identity": await asyncio.to_thread(_path_identity, source),
+                "source_identity": await run_blocking(_path_identity, source),
             }
         )
         return call.model_copy(update={"arguments": bound.model_dump(mode="json")}), bound
@@ -423,18 +422,16 @@ class MovePathTool(BaseTool):
             raise ToolValidationError("cross-volume moves are not supported safely")
         try:
             if os.name == "nt":
-                await asyncio.to_thread(
-                    move_path_by_handle, source, destination, values.source_identity
-                )
+                await run_blocking(move_path_by_handle, source, destination, values.source_identity)
             else:
-                await asyncio.to_thread(_require_expected_identity, source, values.source_identity)
+                await run_blocking(_require_expected_identity, source, values.source_identity)
                 if destination.exists():
                     raise ToolValidationError(
                         "destination already exists; overwrite is not supported"
                     )
                 if not destination.parent.is_dir():
                     raise ToolValidationError("destination parent directory does not exist")
-                await asyncio.to_thread(source.rename, destination)
+                await run_blocking(source.rename, destination)
         except OSError as exc:
             raise ToolExecutionError(f"could not move path safely: {exc}") from exc
         return PathResult(message=f"Moved {source} to {destination}.", path=str(destination))
@@ -482,7 +479,7 @@ class DeletePathTool(BaseTool):
                 "path": str(
                     path := self._scope.resolve(values.path, must_exist=True, allow_root=False)
                 ),
-                "target_identity": await asyncio.to_thread(_path_identity, path),
+                "target_identity": await run_blocking(_path_identity, path),
             }
         )
         return call.model_copy(update={"arguments": bound.model_dump(mode="json")}), bound
@@ -494,25 +491,25 @@ class DeletePathTool(BaseTool):
             raise ToolValidationError("delete target is not bound to a confirmed identity")
         cancellation.raise_if_cancelled()
         if os.name == "nt":
-            await asyncio.to_thread(
+            await run_blocking(
                 delete_path_by_handle,
                 path,
                 values.target_identity,
                 recursive=values.recursive,
             )
         else:
-            await asyncio.to_thread(_require_expected_identity, path, values.target_identity)
+            await run_blocking(_require_expected_identity, path, values.target_identity)
             if path.is_symlink() or path.is_file():
-                await asyncio.to_thread(path.unlink)
+                await run_blocking(path.unlink)
             elif path.is_dir():
                 if any(path.iterdir()) and not values.recursive:
                     raise ToolValidationError(
                         "folder is not empty; recursive must be explicitly true"
                     )
                 if values.recursive:
-                    await asyncio.to_thread(shutil.rmtree, path)
+                    await run_blocking(shutil.rmtree, path)
                 else:
-                    await asyncio.to_thread(path.rmdir)
+                    await run_blocking(path.rmdir)
             else:
                 raise ToolValidationError("target is not a regular file or directory")
         return PathResult(message=f"Deleted {path}.", path=str(path))

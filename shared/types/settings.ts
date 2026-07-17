@@ -23,6 +23,6 @@ export interface AssistantSettings {
 
 export interface ProviderStatus {
   name: string;
-  status: "ready" | "not_configured" | "unavailable" | "error";
+  status: "ready" | "configured" | "not_configured" | "unavailable" | "error";
   detail: string;
 }

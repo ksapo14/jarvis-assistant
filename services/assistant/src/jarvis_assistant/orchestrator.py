@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import sys
 import time
 from collections.abc import AsyncIterator
@@ -41,6 +42,7 @@ from .providers.base import (
 )
 from .providers.piper import PiperTextToSpeechProvider
 from .state import StateMachine
+from .tools.base import ToolError
 from .tools.registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
@@ -88,6 +90,7 @@ class AssistantOrchestrator:
         self._wake_capture_idle = asyncio.Event()
         self._wake_capture_idle.set()
         self._wake_paused = False
+        self._accepting_operations = True
         self._shutdown = asyncio.Event()
         self._persisted_commands: set[UUID] = set()
         self._baseline_settings = self._capture_resettable_settings()
@@ -128,7 +131,7 @@ class AssistantOrchestrator:
 
     async def shutdown(self) -> None:
         self._shutdown.set()
-        await self.cancel()
+        await self.quiesce()
         if self._wake_task is not None:
             self._wake_task.cancel()
             with suppress(asyncio.CancelledError):
@@ -180,6 +183,8 @@ class AssistantOrchestrator:
         before_start: Any | None = None,
     ) -> None:
         async with self._operation_lock:
+            if not self._accepting_operations or self._shutdown.is_set():
+                raise AssistantBusyError("the assistant is stopping and cannot accept new commands")
             if self._active_task is not None and not self._active_task.done():
                 raise AssistantBusyError("the assistant is already handling a command")
             self._wake_paused = True
@@ -221,7 +226,7 @@ class AssistantOrchestrator:
             response = await operation(cancellation)
             if command_id in self._persisted_commands:
                 await self.memory.finish_command(str(command_id), response or "", "completed")
-        except OperationCancelled:
+        except (OperationCancelled, asyncio.CancelledError):
             logger.info("assistant operation cancelled", extra={"command_id": str(command_id)})
             if command_id in self._persisted_commands:
                 await self.memory.finish_command(str(command_id), "Cancelled", "cancelled")
@@ -248,7 +253,7 @@ class AssistantOrchestrator:
                 if asyncio.current_task() is self._active_task:
                     self._active_task = None
                     self._active_cancellation = None
-                    self._wake_paused = False
+                    self._wake_paused = not self._accepting_operations
                 self._persisted_commands.discard(command_id)
 
     async def _capture_and_process(self, command_id: UUID, cancellation: CancellationToken) -> str:
@@ -313,8 +318,10 @@ class AssistantOrchestrator:
         else:
             history = [user_message]
             summary = None
-        descriptors = await self._enabled_descriptors()
+        descriptors = await self._enabled_descriptors(text)
         messages = history
+        failed_tool_names: set[str] = set()
+        failure_summaries: list[str] = []
         for _iteration in range(4):
             cancellation.raise_if_cancelled()
             response = await self.language_model.complete(
@@ -335,7 +342,18 @@ class AssistantOrchestrator:
                     )
                 )
                 for call in response.tool_calls:
-                    result = await self._execute_tool(command_id, call, cancellation)
+                    if call.name in failed_tool_names:
+                        result = await self._record_blocked_repeat(command_id, call)
+                    else:
+                        result = await self._execute_tool(
+                            command_id,
+                            call,
+                            cancellation,
+                            request_text=text,
+                        )
+                    if not result.success:
+                        failed_tool_names.add(call.name)
+                        failure_summaries.append(result.summary)
                     full_tool_message = ConversationMessage(
                         role=ConversationRole.TOOL,
                         name=call.name,
@@ -353,6 +371,24 @@ class AssistantOrchestrator:
                         await self.memory.add_conversation(
                             full_tool_message.model_copy(update={"content": stored_content})
                         )
+                if failed_tool_names:
+                    descriptors = [
+                        descriptor
+                        for descriptor in descriptors
+                        if descriptor.name not in failed_tool_names
+                    ]
+                if len(failure_summaries) >= 2:
+                    explanation = (
+                        "I couldn't complete that request safely after repeated tool failures. "
+                        f"{failure_summaries[-1]}"
+                    )
+                    return await self._deliver_response(
+                        command_id,
+                        explanation,
+                        explanation,
+                        cancellation,
+                        save_history=save_history,
+                    )
                 if self.state.current is not AssistantState.THINKING:
                     await self.state.transition(AssistantState.THINKING)
                 continue
@@ -361,43 +397,75 @@ class AssistantOrchestrator:
             if not final_text:
                 final_text = "I couldn't produce a reliable response."
                 spoken_text = final_text
-            assistant_message = ConversationMessage(
-                role=ConversationRole.ASSISTANT, content=final_text
+            return await self._deliver_response(
+                command_id,
+                final_text,
+                spoken_text,
+                cancellation,
+                save_history=save_history,
             )
-            if save_history:
-                await self.memory.add_conversation(assistant_message)
-                await self._update_local_summary()
-            await self.event_bus.publish(
-                EventType.ASSISTANT_RESPONSE,
-                {
-                    "command_id": str(command_id),
-                    "text": final_text,
-                    "spoken_text": spoken_text,
-                },
-            )
-            if spoken_text and not self.voice_muted:
-                await self.state.transition(AssistantState.SPEAKING)
-                try:
-                    await self.text_to_speech.speak(spoken_text, cancellation)
-                except ProviderError as exc:
-                    logger.warning("text-to-speech unavailable", extra={"error": str(exc)})
-                    await self.event_bus.publish(
-                        EventType.ERROR,
-                        {"code": exc.code, "message": _plain_error(exc), "recoverable": True},
-                    )
-            await self._return_to_idle()
-            return final_text
         raise ProviderError("the model exceeded the maximum tool-call rounds")
 
     async def _execute_tool(
-        self, command_id: UUID, call: ToolCall, cancellation: CancellationToken
+        self,
+        command_id: UUID,
+        call: ToolCall,
+        cancellation: CancellationToken,
+        *,
+        request_text: str | None = None,
     ) -> ToolResult:
         cancellation.raise_if_cancelled()
-        tool, arguments = self.registry.validate(call)
-        descriptor = tool.descriptor
+        try:
+            tool = self.registry.get(call.name)
+            descriptor = tool.descriptor
+        except Exception as exc:
+            result = ToolResult(
+                tool_call_id=call.id,
+                tool_name=call.name,
+                success=False,
+                summary="The requested tool is not registered.",
+                error_code=getattr(exc, "code", "unknown_tool"),
+            )
+            await self.event_bus.publish(
+                EventType.TOOL_EXECUTION_RESULT,
+                {"command_id": str(command_id), **result.model_dump(mode="json")},
+            )
+            return result
+        if request_text is not None and not _request_allows_sensitive_tool(
+            request_text, call.name, call.arguments
+        ):
+            result = ToolResult(
+                tool_call_id=call.id,
+                tool_name=call.name,
+                success=False,
+                summary=(
+                    f"I did not run {call.name} because the request did not explicitly ask "
+                    "for that sensitive action."
+                ),
+                error_code="request_intent_mismatch",
+            )
+            await self._record_tool(command_id, call, result, descriptor, None)
+            return result
+        try:
+            arguments = tool.validate(call.arguments)
+        except Exception as exc:
+            result = _tool_failure_result(call, exc, "The tool arguments were invalid.")
+            await self._record_tool(command_id, call, result, descriptor, None)
+            return result
         authorization = await self.permissions.authorize(descriptor)
         if authorization.allowed:
-            call, arguments = await tool.bind_confirmation(call, arguments, cancellation)
+            try:
+                call, arguments = await tool.bind_confirmation(call, arguments, cancellation)
+            except OperationCancelled:
+                raise
+            except Exception as exc:
+                result = _tool_failure_result(
+                    call,
+                    exc,
+                    "The tool target could not be bound safely.",
+                )
+                await self._record_tool(command_id, call, result, descriptor, None)
+                return result
         cancellation.raise_if_cancelled()
         await self.event_bus.publish(
             EventType.TOOL_PROPOSAL,
@@ -487,6 +555,60 @@ class AssistantOrchestrator:
             await self.state.transition(AssistantState.THINKING)
         await self._record_tool(command_id, call, result, descriptor, confirmation_result)
         return result
+
+    async def _record_blocked_repeat(self, command_id: UUID, call: ToolCall) -> ToolResult:
+        result = ToolResult(
+            tool_call_id=call.id,
+            tool_name=call.name,
+            success=False,
+            summary="That tool was disabled for this request after its earlier failure.",
+            error_code="tool_disabled_after_failure",
+        )
+        try:
+            descriptor = self.registry.get(call.name).descriptor
+        except Exception:
+            await self.event_bus.publish(
+                EventType.TOOL_EXECUTION_RESULT,
+                {"command_id": str(command_id), **result.model_dump(mode="json")},
+            )
+        else:
+            await self._record_tool(command_id, call, result, descriptor, None)
+        return result
+
+    async def _deliver_response(
+        self,
+        command_id: UUID,
+        text: str,
+        spoken_text: str,
+        cancellation: CancellationToken,
+        *,
+        save_history: bool,
+    ) -> str:
+        cancellation.raise_if_cancelled()
+        assistant_message = ConversationMessage(role=ConversationRole.ASSISTANT, content=text)
+        if save_history:
+            await self.memory.add_conversation(assistant_message)
+            await self._update_local_summary()
+        await self.event_bus.publish(
+            EventType.ASSISTANT_RESPONSE,
+            {
+                "command_id": str(command_id),
+                "text": text,
+                "spoken_text": spoken_text,
+            },
+        )
+        if spoken_text and not self.voice_muted:
+            await self.state.transition(AssistantState.SPEAKING)
+            try:
+                await self.text_to_speech.speak(spoken_text, cancellation)
+            except ProviderError as exc:
+                logger.warning("text-to-speech unavailable", extra={"error": str(exc)})
+                await self.event_bus.publish(
+                    EventType.ERROR,
+                    {"code": exc.code, "message": _plain_error(exc), "recoverable": True},
+                )
+        await self._return_to_idle()
+        return text
 
     async def _wait_for_confirmation(
         self,
@@ -596,12 +718,16 @@ class AssistantOrchestrator:
         if summary:
             await self.memory.set_summary(summary)
 
-    async def _enabled_descriptors(self) -> list[ToolDescriptor]:
+    async def _enabled_descriptors(self, request_text: str | None = None) -> list[ToolDescriptor]:
         descriptors: list[ToolDescriptor] = []
         for descriptor in self.registry.descriptors():
             if (
                 descriptor.permission_category.value == "development"
                 and not self.settings.developer_mode
+            ):
+                continue
+            if request_text is not None and not _request_allows_sensitive_tool(
+                request_text, descriptor.name
             ):
                 continue
             enabled, permission = await self.permissions.policy_for(descriptor)
@@ -613,17 +739,56 @@ class AssistantOrchestrator:
         cancellation = self._active_cancellation
         if cancellation is not None:
             cancellation.cancel()
-        await self.text_to_speech.cancel()
-        await self.confirmations.cancel_all()
+        await asyncio.gather(
+            self.text_to_speech.cancel(),
+            self.confirmations.cancel_all(),
+            return_exceptions=True,
+        )
+
+    async def cancel_and_wait(self) -> None:
+        """Cancel active work and wait until it can no longer mutate local state."""
+        await self.cancel()
+        await self._settle_active_operation()
+
+    async def quiesce(self) -> None:
+        """Block new commands, stop microphone capture, and drain current work."""
+        async with self._operation_lock:
+            self._accepting_operations = False
+            self._wake_paused = True
+        await self._stop_wake_capture()
+        await self.cancel_and_wait()
+
+    async def resume_operations(self) -> None:
+        """Resume commands after a bounded maintenance operation."""
+        async with self._operation_lock:
+            if self._shutdown.is_set():
+                return
+            self._accepting_operations = True
+            self._wake_paused = False
+
+    async def _settle_active_operation(self) -> None:
         active_task = self._active_task
         if active_task is None or active_task is asyncio.current_task():
             return
         try:
-            await asyncio.wait_for(asyncio.shield(active_task), timeout=10)
-        except TimeoutError as exc:
+            await asyncio.wait_for(asyncio.shield(active_task), timeout=2)
+        except asyncio.CancelledError:
+            pass
+        except TimeoutError:
+            logger.warning("forcing an unresponsive assistant operation to stop")
+            active_task.cancel()
+            done, _pending = await asyncio.wait({active_task}, timeout=2)
+            if not done:
+                raise AssistantBusyError(
+                    "the active operation did not stop safely; local data was not changed"
+                ) from None
+        if not active_task.done():
             raise AssistantBusyError(
-                "the active operation did not reach a safe stopping point; data was not cleared"
-            ) from exc
+                "the active operation did not stop safely; local data was not changed"
+            )
+        async with self._operation_lock:
+            if self._active_task is None:
+                await self._return_to_idle()
 
     async def set_voice_muted(self, muted: bool) -> None:
         self.voice_muted = muted
@@ -843,6 +1008,110 @@ def _plain_error(error: Exception) -> str:
     if not message:
         return "The operation failed unexpectedly."
     return message[:500]
+
+
+def _tool_failure_result(
+    call: ToolCall,
+    error: Exception,
+    fallback_summary: str,
+) -> ToolResult:
+    summary = _plain_error(error) if isinstance(error, ToolError) else fallback_summary
+    return ToolResult(
+        tool_call_id=call.id,
+        tool_name=call.name,
+        success=False,
+        summary=summary,
+        error_code=getattr(error, "code", "tool_binding_failed"),
+    )
+
+
+_POWER_TARGET = r"(?:computer|pc|windows|system|device|machine)"
+_POWER_ACTION_PATTERNS: dict[str, tuple[str, ...]] = {
+    "shutdown": (r"shut\s*down", r"shutdown", r"power\s+off"),
+    "restart": (r"restart", r"reboot"),
+    "sleep": (r"(?:put|go)\s+(?:to\s+)?sleep", r"sleep"),
+    "sign_out": (r"sign\s+out", r"log\s+off", r"log\s+out"),
+}
+
+
+def _request_allows_sensitive_tool(
+    request_text: str,
+    tool_name: str,
+    arguments: dict[str, object] | None = None,
+) -> bool:
+    normalized = " ".join(request_text.casefold().split())
+    if tool_name == "close_application":
+        if not re.search(r"\b(?:close|quit|exit)\b", normalized):
+            return False
+        if re.search(
+            r"\b(?:do\s+not|don't|dont|never|not)\b.{0,24}\b(?:close|quit|exit)\b",
+            normalized,
+        ):
+            return False
+        if not arguments:
+            return True
+        application_name = arguments.get("application_name")
+        process_id = arguments.get("process_id")
+        if isinstance(application_name, str):
+            target = re.sub(r"\.exe$", "", application_name.casefold().strip())
+            target = " ".join(re.findall(r"[a-z0-9]+", target))
+            normalized_words = " ".join(re.findall(r"[a-z0-9]+", normalized))
+            return (
+                bool(target)
+                and target in normalized_words
+                and not _target_is_excluded(normalized_words, target)
+            )
+        if isinstance(process_id, int):
+            process_target = str(process_id)
+            return not _target_is_excluded(normalized, process_target, pid=True) and (
+                process_target in normalized
+                or bool(
+                    re.search(
+                        r"\b(?:this|current|active)\s+(?:app|application|window)\b",
+                        normalized,
+                    )
+                )
+            )
+        return False
+    if tool_name != "system_power_action":
+        return True
+    requested_action = arguments.get("action") if arguments else None
+    actions = (
+        (requested_action,)
+        if isinstance(requested_action, str) and requested_action in _POWER_ACTION_PATTERNS
+        else tuple(_POWER_ACTION_PATTERNS)
+    )
+    for action in actions:
+        for phrase in _POWER_ACTION_PATTERNS[action]:
+            if re.search(
+                rf"\b(?:do\s+not|don't|dont|never|not)\b.{{0,30}}\b{phrase}\b",
+                normalized,
+            ):
+                continue
+            if re.fullmatch(rf"(?:please\s+)?{phrase}(?:\s+please)?", normalized):
+                return True
+            if re.search(
+                rf"(?:\b{phrase}\b.{{0,30}}\b{_POWER_TARGET}\b|"
+                rf"\b{_POWER_TARGET}\b.{{0,30}}\b{phrase}\b)",
+                normalized,
+            ):
+                return True
+    return False
+
+
+def _target_is_excluded(request_text: str, target: str, *, pid: bool = False) -> bool:
+    escaped_target = re.escape(target).replace(r"\ ", r"\s+")
+    pid_prefix = r"(?:pid\s+)?" if pid else ""
+    return bool(
+        re.search(
+            rf"\b(?:not|except|excluding|exclude)\s+(?:the\s+)?{pid_prefix}{escaped_target}\b",
+            request_text,
+        )
+        or re.search(
+            rf"\b(?:leave|keep)\s+(?:the\s+)?{pid_prefix}{escaped_target}\b",
+            request_text,
+        )
+    )
 
 
 def _spoken_confirmation_prompt(prompt: str) -> str:

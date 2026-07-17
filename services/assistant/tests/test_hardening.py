@@ -112,6 +112,9 @@ def test_gemini_schema_dereferences_every_registered_tool(settings: Settings) ->
         "maximize",
         "restore",
         "focus",
+        "move",
+        "resize",
+        "move_resize",
     ]
 
 
