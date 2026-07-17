@@ -16,6 +16,7 @@ from ..process_io import (
     ProcessTimeoutError,
     collect_process_output,
     decode_redacted_child_output,
+    hidden_subprocess_kwargs,
     sanitized_child_environment,
     terminate_process_tree,
 )
@@ -63,6 +64,7 @@ class PiperTextToSpeechProvider(TextToSpeechProvider):
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     env=sanitized_child_environment(),
+                    **hidden_subprocess_kwargs(),
                 )
                 if self._process.stdin is None:
                     raise ProviderUnavailableError("Piper input pipe was unavailable")

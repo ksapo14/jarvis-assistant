@@ -46,7 +46,10 @@ const idleSnapshot: AssistantSnapshot = {
   updatedAt: "2026-07-16T12:00:00.000Z",
 };
 
-function mockContext(snapshot: AssistantSnapshot = idleSnapshot) {
+function mockContext(
+  snapshot: AssistantSnapshot = idleSnapshot,
+  controlPending: "starting" | "stopping" | "cancelling" | null = null,
+) {
   const actions = {
     toggleListening: vi.fn(() => Promise.resolve()),
     cancel: vi.fn(() => Promise.resolve()),
@@ -67,6 +70,7 @@ function mockContext(snapshot: AssistantSnapshot = idleSnapshot) {
     history: [],
     providers: [],
     microphones: [],
+    controlPending,
     loading: false,
     uiError: null,
     ...actions,
@@ -122,5 +126,34 @@ describe("AssistantPage", () => {
 
     expect(screen.getByRole("button", { name: "Start push to talk" })).toBeDisabled();
     expect(screen.getByRole("textbox", { name: "Type a command" })).toBeDisabled();
+  });
+
+  it("stops speech without presenting the action as a restart", async () => {
+    const user = userEvent.setup();
+    const actions = mockContext({
+      ...idleSnapshot,
+      state: "speaking",
+      detail: "Speaking",
+    });
+    render(<AssistantPage />);
+
+    await user.click(screen.getByRole("button", { name: "Stop speaking" }));
+
+    expect(actions.toggleListening).toHaveBeenCalledOnce();
+  });
+
+  it("disables repeated controls while cancellation is pending", () => {
+    mockContext(
+      {
+        ...idleSnapshot,
+        state: "speaking",
+        detail: "Cancelling the current operation…",
+      },
+      "cancelling",
+    );
+    render(<AssistantPage />);
+
+    expect(screen.getByRole("button", { name: "Cancelling operation" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Stopping…" })).toBeDisabled();
   });
 });

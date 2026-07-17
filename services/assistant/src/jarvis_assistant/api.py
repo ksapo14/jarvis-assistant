@@ -38,6 +38,7 @@ from .models import (
 )
 from .orchestrator import AssistantBusyError
 from .parent_watchdog import ParentProcessWatchdog, cancel_watchdog
+from .process_io import run_blocking
 from .runtime import AssistantRuntime
 
 logger = logging.getLogger(__name__)
@@ -81,6 +82,7 @@ def create_app(
     parent_watchdog: ParentProcessWatchdog | None = None,
 ) -> FastAPI:
     runtime = runtime or AssistantRuntime.create()
+    maintenance_lock = asyncio.Lock()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -233,12 +235,18 @@ def create_app(
 
     @app.post("/v1/listen/stop", dependencies=[auth])
     async def stop_listening() -> dict[str, bool]:
-        await runtime.orchestrator.cancel()
+        try:
+            await runtime.orchestrator.cancel_and_wait()
+        except AssistantBusyError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {"cancelled": True}
 
     @app.post("/v1/cancel", dependencies=[auth])
     async def cancel() -> dict[str, bool]:
-        await runtime.orchestrator.cancel()
+        try:
+            await runtime.orchestrator.cancel_and_wait()
+        except AssistantBusyError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {"cancelled": True}
 
     @app.post("/v1/voice/mute", dependencies=[auth])
@@ -264,17 +272,21 @@ def create_app(
 
     @app.delete("/v1/data", dependencies=[auth])
     async def clear_data() -> dict[str, bool]:
-        await runtime.orchestrator.cancel()
-        await runtime.memory.clear_local_data()
-        await runtime.orchestrator.reset_settings()
-        await asyncio.to_thread(clear_app_owned_screenshots, runtime.settings.data_dir)
-        clear_rotating_logs(
-            runtime.settings.log_dir,
-            data_dir=runtime.settings.data_dir,
-            level=runtime.settings.log_level,
-            max_bytes=runtime.settings.log_max_bytes,
-            backup_count=runtime.settings.log_backup_count,
-        )
+        async with maintenance_lock:
+            try:
+                await runtime.orchestrator.quiesce()
+                await runtime.memory.clear_local_data()
+                await runtime.orchestrator.reset_settings()
+                await run_blocking(clear_app_owned_screenshots, runtime.settings.data_dir)
+                clear_rotating_logs(
+                    runtime.settings.log_dir,
+                    data_dir=runtime.settings.data_dir,
+                    level=runtime.settings.log_level,
+                    max_bytes=runtime.settings.log_max_bytes,
+                    backup_count=runtime.settings.log_backup_count,
+                )
+            finally:
+                await runtime.orchestrator.resume_operations()
         return {"cleared": True}
 
     @app.post("/v1/shutdown", dependencies=[auth])

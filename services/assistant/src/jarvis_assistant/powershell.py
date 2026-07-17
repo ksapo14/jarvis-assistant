@@ -16,6 +16,7 @@ from .process_io import (
     ProcessTimeoutError,
     collect_process_output,
     decode_redacted_child_output,
+    hidden_subprocess_kwargs,
     sanitized_child_environment,
 )
 
@@ -210,6 +211,7 @@ class PowerShellRunner:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=environment,
+            **hidden_subprocess_kwargs(),
         )
         try:
             output = await collect_process_output(

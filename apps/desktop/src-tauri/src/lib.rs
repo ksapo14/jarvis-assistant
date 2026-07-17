@@ -29,6 +29,7 @@ struct AppRuntime {
     configured_port: Option<u16>,
     backend_port: Mutex<Option<u16>>,
     backend: Mutex<Option<Child>>,
+    minimize_to_tray: AtomicBool,
     shutting_down: AtomicBool,
 }
 
@@ -39,6 +40,7 @@ impl AppRuntime {
             configured_port: configured_backend_port()?,
             backend_port: Mutex::new(None),
             backend: Mutex::new(None),
+            minimize_to_tray: AtomicBool::new(true),
             shutting_down: AtomicBool::new(false),
         })
     }
@@ -63,6 +65,27 @@ fn get_backend_config(runtime: tauri::State<'_, AppRuntime>) -> Result<BackendCo
         session_token: runtime.session_token.clone(),
         base_url: backend_base_url(port),
     })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CloseBehavior {
+    HideToTray,
+    Exit,
+}
+
+fn close_behavior(minimize_to_tray: bool) -> CloseBehavior {
+    if minimize_to_tray {
+        CloseBehavior::HideToTray
+    } else {
+        CloseBehavior::Exit
+    }
+}
+
+#[tauri::command]
+fn set_close_behavior(runtime: tauri::State<'_, AppRuntime>, minimize_to_tray: bool) {
+    runtime
+        .minimize_to_tray
+        .store(minimize_to_tray, Ordering::Release);
 }
 
 #[tauri::command]
@@ -246,7 +269,7 @@ fn configure_tray(app: &tauri::App) -> tauri::Result<()> {
             "settings" => show_window(app, Some("general")),
             "activity" => show_window(app, Some("history")),
             "quit" => {
-                app.exit(0);
+                request_exit(app);
             }
             _ => {}
         })
@@ -488,6 +511,11 @@ fn stop_backend(app: &tauri::AppHandle) {
     if runtime.shutting_down.swap(true, Ordering::AcqRel) {
         return;
     }
+    stop_backend_after_mark(app);
+}
+
+fn stop_backend_after_mark(app: &tauri::AppHandle) {
+    let runtime = app.state::<AppRuntime>();
     let port = runtime
         .backend_port
         .lock()
@@ -499,7 +527,7 @@ fn stop_backend(app: &tauri::AppHandle) {
     let token = runtime.session_token.clone();
     if let Some(port) = port {
         if let Ok(client) = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(2))
+            .timeout(Duration::from_secs(5))
             .build()
         {
             let _ = client
@@ -511,7 +539,7 @@ fn stop_backend(app: &tauri::AppHandle) {
     }
     if let Ok(mut guard) = runtime.backend.lock() {
         if let Some(child) = guard.as_mut() {
-            let deadline = Instant::now() + Duration::from_secs(4);
+            let deadline = Instant::now() + Duration::from_secs(8);
             while Instant::now() < deadline {
                 match child.try_wait() {
                     Ok(Some(_)) => {
@@ -527,6 +555,21 @@ fn stop_backend(app: &tauri::AppHandle) {
         }
         *guard = None;
     };
+}
+
+fn request_exit(app: &tauri::AppHandle) {
+    let runtime = app.state::<AppRuntime>();
+    if runtime.shutting_down.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.hide();
+    }
+    let app = app.clone();
+    std::thread::spawn(move || {
+        stop_backend_after_mark(&app);
+        app.exit(0);
+    });
 }
 
 fn monitor_backend(app: &tauri::AppHandle) {
@@ -586,7 +629,8 @@ pub fn run() {
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             get_backend_config,
-            open_log_directory
+            open_log_directory,
+            set_close_behavior
         ])
         .setup(|app| {
             configure_tray(app)?;
@@ -602,17 +646,50 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("failed to build the JARVIS desktop host");
 
-    app.run(|app, event| {
-        if matches!(event, RunEvent::Exit | RunEvent::ExitRequested { .. }) {
-            stop_backend(app);
+    app.run(|app, event| match event {
+        RunEvent::WindowEvent {
+            label,
+            event: tauri::WindowEvent::CloseRequested { api, .. },
+            ..
+        } if label == "main" => {
+            let runtime = app.state::<AppRuntime>();
+            api.prevent_close();
+            match close_behavior(runtime.minimize_to_tray.load(Ordering::Acquire)) {
+                CloseBehavior::HideToTray => {
+                    if let Some(window) = app.get_webview_window("main") {
+                        let _ = window.hide();
+                    }
+                }
+                CloseBehavior::Exit => {
+                    request_exit(app);
+                }
+            }
         }
+        RunEvent::ExitRequested { api, .. } => {
+            if !app
+                .state::<AppRuntime>()
+                .shutting_down
+                .load(Ordering::Acquire)
+            {
+                api.prevent_exit();
+                request_exit(app);
+            }
+        }
+        RunEvent::Exit => stop_backend(app),
+        _ => {}
     });
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_readiness, wait_for_managed_readiness};
+    use super::{close_behavior, parse_readiness, wait_for_managed_readiness, CloseBehavior};
     use std::{env, fs, process::Command, thread, time::Duration};
+
+    #[test]
+    fn close_behavior_follows_the_synchronized_minimize_setting() {
+        assert_eq!(close_behavior(true), CloseBehavior::HideToTray);
+        assert_eq!(close_behavior(false), CloseBehavior::Exit);
+    }
 
     #[test]
     fn readiness_requires_matching_nonce_runtime_pid_and_safe_port() {

@@ -4,10 +4,13 @@ import asyncio
 import os
 import re
 import shutil
-from collections.abc import Mapping
+import subprocess
+from collections.abc import Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
+from typing import Any, ParamSpec, TypeVar
 
 from .cancellation import CancellationToken, OperationCancelled
 from .logging_config import redact
@@ -60,6 +63,40 @@ class BoundedProcessOutput:
     returncode: int
     stdout: bytes
     stderr: bytes
+
+
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+
+
+async def run_blocking(
+    function: Callable[_P, _R],
+    *args: _P.args,
+    **kwargs: _P.kwargs,
+) -> _R:
+    """Run local blocking work without detaching it when the async caller is cancelled."""
+    future = asyncio.get_running_loop().run_in_executor(
+        None,
+        partial(function, *args, **kwargs),
+    )
+    try:
+        return await asyncio.shield(future)
+    except asyncio.CancelledError:
+        while not future.done():
+            try:
+                await asyncio.shield(future)
+            except asyncio.CancelledError:
+                continue
+        with suppress(Exception):
+            future.result()
+        raise
+
+
+def hidden_subprocess_kwargs() -> dict[str, Any]:
+    """Prevent helper processes from creating a visible console on Windows."""
+    if os.name != "nt":
+        return {}
+    return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)}
 
 
 def is_sensitive_environment_name(name: str) -> bool:
@@ -143,6 +180,7 @@ async def launch_associated_target(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         env=environment,
+        **hidden_subprocess_kwargs(),
     )
     output = await collect_process_output(
         process,

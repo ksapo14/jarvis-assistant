@@ -23,6 +23,8 @@ from ..process_io import (
     ProcessTimeoutError,
     collect_process_output,
     decode_redacted_child_output,
+    hidden_subprocess_kwargs,
+    run_blocking,
     sanitized_child_environment,
 )
 from .base import BaseTool, ToolExecutionError, ToolUnavailableError, ToolValidationError
@@ -243,7 +245,7 @@ class ExecuteTrustedScriptTool(BaseTool):
         values = cast(TrustedScriptArguments, arguments)
         script = self._scope.resolve(values.script_path, must_exist=True, allow_root=False)
         self._require_approved_script(script)
-        digest = await asyncio.to_thread(_script_sha256, script)
+        digest = await run_blocking(_script_sha256, script)
         bound = values.model_copy(
             update={
                 "script_path": str(script),
@@ -367,7 +369,7 @@ class ForceTerminateProcessTool(BaseTool):
         values = cast(TerminateProcessArguments, arguments)
         if values.process_id == os.getpid():
             raise ToolValidationError("the assistant cannot terminate itself")
-        name, create_time = await asyncio.to_thread(_process_identity, values.process_id)
+        name, create_time = await run_blocking(_process_identity, values.process_id)
         if name.casefold() in self._CRITICAL_NAMES:
             raise ToolValidationError(f"refusing to terminate critical process {name}")
         bound = values.model_copy(
@@ -404,7 +406,7 @@ class ForceTerminateProcessTool(BaseTool):
             if name.casefold() in self._CRITICAL_NAMES:
                 raise ToolValidationError(f"refusing to terminate critical process {name}")
             process.kill()
-            await asyncio.to_thread(process.wait, 5)
+            await run_blocking(process.wait, 5)
         except psutil.NoSuchProcess as exc:
             raise ToolValidationError("process no longer exists") from exc
         except psutil.AccessDenied as exc:
@@ -529,6 +531,7 @@ async def _run_process(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         env=sanitized_child_environment(),
+        **hidden_subprocess_kwargs(),
     )
     try:
         output = await collect_process_output(

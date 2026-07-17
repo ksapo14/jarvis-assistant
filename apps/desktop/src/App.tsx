@@ -1,3 +1,4 @@
+import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { register, unregister } from "@tauri-apps/plugin-global-shortcut";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -108,19 +109,12 @@ export default function App() {
 
   useEffect(() => {
     if (!window.__TAURI_INTERNALS__) return;
-    let unlisten: UnlistenFn | undefined;
-    const currentWindow = getCurrentWindow();
-    void currentWindow
-      .onCloseRequested((event) => {
-        if (!settings.minimizeToTray) return;
-        event.preventDefault();
-        void currentWindow.hide();
-      })
-      .then((dispose) => {
-        unlisten = dispose;
-      });
-    return () => unlisten?.();
-  }, [settings.minimizeToTray]);
+    void invoke("set_close_behavior", {
+      minimizeToTray: settings.minimizeToTray,
+    }).catch((error: unknown) => {
+      reportError(`Could not update the window close behavior: ${String(error)}`);
+    });
+  }, [reportError, settings.minimizeToTray]);
 
   useEffect(() => {
     if (!window.__TAURI_INTERNALS__) return;

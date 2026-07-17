@@ -19,6 +19,7 @@ export function AssistantPage() {
     snapshot,
     confirmation,
     settings,
+    controlPending,
     toggleListening,
     cancel,
     sendCommand,
@@ -28,6 +29,7 @@ export function AssistantPage() {
   const isListening = ["listening", "transcribing"].includes(snapshot.state);
   const isBusy = activeStates.has(snapshot.state);
   const canInterruptSpeech = snapshot.state === "speaking";
+  const isControlPending = controlPending !== null;
 
   const submit = (event: FormEvent) => {
     event.preventDefault();
@@ -62,31 +64,49 @@ export function AssistantPage() {
           <button
             className="listen-button"
             onClick={() => void toggleListening()}
-            disabled={!snapshot.connected || (isBusy && !isListening && !canInterruptSpeech)}
+            disabled={
+              !snapshot.connected ||
+              isControlPending ||
+              (isBusy && !isListening && !canInterruptSpeech)
+            }
             aria-label={
-              isListening
-                ? "Stop listening"
-                : canInterruptSpeech
-                  ? "Interrupt speech and start listening"
-                  : "Start push to talk"
+              controlPending === "starting"
+                ? "Starting listening"
+                : controlPending === "stopping"
+                  ? "Stopping listening"
+                  : controlPending === "cancelling"
+                    ? "Cancelling operation"
+                    : isListening
+                      ? "Stop listening"
+                      : canInterruptSpeech
+                        ? "Stop speaking"
+                        : "Start push to talk"
             }
           >
-            <Icon name={isListening ? "stop" : "microphone"} />
+            <Icon name={isListening || isControlPending ? "stop" : "microphone"} />
           </button>
         </div>
         <div className="stage-copy">
           <strong>{stateLabel(snapshot.state)}</strong>
           <span>
-            {isListening
-              ? "Speak naturally. Transcription starts only after activation."
-              : settings.wakeWordEnabled
-                ? `Say “${settings.wakePhrase}” or press ${settings.pushToTalkShortcut} to begin.`
-                : `Wake word is paused. Press ${settings.pushToTalkShortcut} to begin.`}
+            {isControlPending
+              ? controlPending === "starting"
+                ? "Preparing the microphone. Please wait."
+                : "Stopping the current operation. Please wait."
+              : isListening
+                ? "Speak naturally. Transcription starts only after activation."
+                : settings.wakeWordEnabled
+                  ? `Say “${settings.wakePhrase}” or press ${settings.pushToTalkShortcut} to begin.`
+                  : `Wake word is paused. Press ${settings.pushToTalkShortcut} to begin.`}
           </span>
         </div>
         {isBusy && (
-          <button className="button ghost cancel-button" onClick={() => void cancel()}>
-            <Icon name="x" /> Cancel operation
+          <button
+            className="button ghost cancel-button"
+            onClick={() => void cancel()}
+            disabled={isControlPending}
+          >
+            <Icon name="x" /> {isControlPending ? "Stopping…" : "Cancel operation"}
           </button>
         )}
       </section>
@@ -124,9 +144,13 @@ export function AssistantPage() {
           onChange={(event) => setCommand(event.target.value)}
           placeholder="Type a command — useful in mock mode or quiet spaces"
           autoComplete="off"
-          disabled={!snapshot.connected || isBusy}
+          disabled={!snapshot.connected || isBusy || isControlPending}
         />
-        <button className="button primary" type="submit" disabled={!command.trim() || isBusy}>
+        <button
+          className="button primary"
+          type="submit"
+          disabled={!command.trim() || isBusy || isControlPending}
+        >
           Send
         </button>
       </form>
