@@ -973,6 +973,10 @@ input::placeholder {
   background: var(--accent);
 }
 
+.provider-status.configured {
+  background: var(--blue);
+}
+
 .provider-status.not_configured {
   background: var(--amber);
 }

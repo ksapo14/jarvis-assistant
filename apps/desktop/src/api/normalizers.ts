@@ -336,6 +336,7 @@ export function normalizeActivity(value: unknown): ActivityRecord {
 export function normalizeProvider(value: unknown): ProviderStatus {
   const item = asObject(value);
   const rawName = read(item, "name", "name", "Provider");
+  const detail = read(item, "detail", "detail", "No status available");
   const providerLabels: Record<string, string> = {
     deepgram: "Deepgram",
     gemini: "Gemini",
@@ -351,12 +352,14 @@ export function normalizeProvider(value: unknown): ProviderStatus {
   const status =
     typeof explicitStatus === "string"
       ? explicitStatus
-      : item.available === true
-        ? "ready"
-        : "unavailable";
+      : detail.startsWith("Configured for ") && detail.endsWith("; connection not yet verified")
+        ? "configured"
+        : item.available === true
+          ? "ready"
+          : "unavailable";
   return {
     name: providerLabels[rawName] ?? rawName,
     status: status as ProviderStatus["status"],
-    detail: read(item, "detail", "detail", "No status available"),
+    detail,
   };
 }

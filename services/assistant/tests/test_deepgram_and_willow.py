@@ -57,6 +57,18 @@ async def test_deepgram_missing_api_key_fails_without_network() -> None:
             pass
 
 
+async def test_deepgram_configured_status_is_degraded_before_first_request() -> None:
+    status = await DeepgramSpeechToTextProvider("secret", model="nova-3").status()
+    assert status.available is False
+    assert status.detail == "Configured for nova-3; connection not yet verified"
+
+
+async def test_deepgram_missing_key_status_is_unavailable() -> None:
+    status = await DeepgramSpeechToTextProvider(None).status()
+    assert status.available is False
+    assert status.detail == "DEEPGRAM_API_KEY is missing"
+
+
 async def test_deepgram_maps_websocket_auth_failure() -> None:
     class AuthFailure(Exception):
         status_code = 401

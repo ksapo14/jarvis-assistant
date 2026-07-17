@@ -137,6 +137,34 @@ describe("API normalizers", () => {
     });
   });
 
+  it("distinguishes configured providers whose connection is not yet verified", () => {
+    expect(
+      normalizeProvider({
+        name: "gemini",
+        available: false,
+        detail: "Configured for gemini-3.1-flash-lite; connection not yet verified",
+      }),
+    ).toEqual({
+      name: "Gemini",
+      status: "configured",
+      detail: "Configured for gemini-3.1-flash-lite; connection not yet verified",
+    });
+  });
+
+  it("keeps missing credentials unavailable", () => {
+    expect(
+      normalizeProvider({
+        name: "deepgram",
+        available: false,
+        detail: "DEEPGRAM_API_KEY is missing",
+      }),
+    ).toEqual({
+      name: "Deepgram",
+      status: "unavailable",
+      detail: "DEEPGRAM_API_KEY is missing",
+    });
+  });
+
   it("returns null for values without an event type", () => {
     expect(normalizeEvent(null)).toBeNull();
     expect(normalizeEvent({ payload: {} })).toBeNull();
