@@ -1,0 +1,7 @@
+{
+  "environment": "production",
+  "log_level": "INFO",
+  "mock_mode": false,
+  "network": "loopback-only",
+  "notes": "The desktop process supplies a random ASSISTANT_SESSION_TOKEN and provider secrets."
+}

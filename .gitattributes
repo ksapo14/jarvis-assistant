@@ -1,0 +1,12 @@
+* text=auto eol=lf
+
+*.icns binary
+*.ico binary
+*.jpg binary
+*.jpeg binary
+*.msi binary
+*.onnx binary
+*.png binary
+*.tflite binary
+*.wav binary
+*.webp binary

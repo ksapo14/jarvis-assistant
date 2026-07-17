@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://jarvis.local/schemas/settings.schema.json",
+  "title": "Assistant settings API snapshot",
+  "type": "object",
+  "required": [
+    "launch_on_startup",
+    "minimize_to_tray",
+    "play_activation_sound",
+    "save_conversation_history",
+    "developer_mode",
+    "wake_word_enabled",
+    "wake_phrase",
+    "wake_sensitivity",
+    "microphone_device",
+    "push_to_talk_shortcut",
+    "global_shortcut",
+    "piper_executable_path",
+    "piper_model_path",
+    "speech_rate",
+    "speech_volume",
+    "voice_muted",
+    "preferred_applications",
+    "tool_permissions"
+  ],
+  "properties": {
+    "launch_on_startup": { "type": "boolean" },
+    "minimize_to_tray": { "type": "boolean" },
+    "play_activation_sound": { "type": "boolean" },
+    "save_conversation_history": { "type": "boolean" },
+    "developer_mode": { "type": "boolean" },
+    "wake_word_enabled": { "type": "boolean" },
+    "wake_phrase": { "type": "string", "minLength": 1, "maxLength": 100 },
+    "wake_sensitivity": { "type": "number", "minimum": 0, "maximum": 1 },
+    "microphone_device": { "type": ["string", "null"], "maxLength": 300 },
+    "push_to_talk_shortcut": { "type": "string", "minLength": 1, "maxLength": 100 },
+    "global_shortcut": { "type": "string", "minLength": 1, "maxLength": 100 },
+    "piper_executable_path": { "type": "string", "maxLength": 1024 },
+    "piper_model_path": { "type": "string", "maxLength": 1024 },
+    "speech_rate": { "type": "number", "minimum": 0.5, "maximum": 2 },
+    "speech_volume": { "type": "number", "minimum": 0, "maximum": 1 },
+    "voice_muted": { "type": "boolean" },
+    "preferred_applications": {
+      "type": "object",
+      "maxProperties": 64,
+      "propertyNames": { "pattern": "^[a-z0-9][a-z0-9 ._-]{0,63}$" },
+      "additionalProperties": {
+        "type": "string",
+        "minLength": 6,
+        "maxLength": 1024,
+        "pattern": "^[A-Za-z]:[\\\\/].*\\.[eE][xX][eE]$"
+      }
+    },
+    "tool_permissions": {
+      "type": "object",
+      "propertyNames": { "pattern": "^[a-z][a-z0-9_]{0,63}$" },
+      "additionalProperties": {
+        "type": "string",
+        "enum": ["disabled", "ask_every_time", "allow_session", "always_allow"]
+      }
+    }
+  },
+  "additionalProperties": false
+}

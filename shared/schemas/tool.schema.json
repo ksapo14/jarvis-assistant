@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://jarvis.local/schemas/tool.schema.json",
+  "title": "Registered desktop tool API descriptor",
+  "type": "object",
+  "required": [
+    "name",
+    "description",
+    "permission_category",
+    "risk_level",
+    "confirmation_required",
+    "timeout_seconds",
+    "argument_schema",
+    "result_schema",
+    "enabled",
+    "permission"
+  ],
+  "properties": {
+    "name": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,63}$" },
+    "description": { "type": "string", "minLength": 1, "maxLength": 500 },
+    "permission_category": {
+      "type": "string",
+      "enum": [
+        "applications",
+        "files",
+        "windows",
+        "input",
+        "clipboard",
+        "screen_capture",
+        "system",
+        "development",
+        "communications"
+      ]
+    },
+    "risk_level": { "type": "string", "enum": ["low", "medium", "high"] },
+    "confirmation_required": { "type": "boolean" },
+    "timeout_seconds": { "type": "number", "exclusiveMinimum": 0, "maximum": 300 },
+    "argument_schema": { "type": "object" },
+    "result_schema": { "type": "object" },
+    "enabled": { "type": "boolean" },
+    "permission": {
+      "type": "string",
+      "enum": ["disabled", "ask_every_time", "allow_session", "always_allow"]
+    }
+  },
+  "additionalProperties": false
+}

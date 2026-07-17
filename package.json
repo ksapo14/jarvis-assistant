@@ -1,0 +1,23 @@
+{
+  "name": "jarvis-desktop-assistant",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "apps/desktop"
+  ],
+  "scripts": {
+    "dev": "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/dev.ps1",
+    "setup": "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/setup.ps1",
+    "lint": "npm run desktop:lint",
+    "test": "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/test.ps1",
+    "build": "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1",
+    "desktop:dev": "npm --workspace @jarvis/desktop run tauri:dev",
+    "desktop:build": "npm --workspace @jarvis/desktop run build",
+    "desktop:lint": "npm --workspace @jarvis/desktop run lint",
+    "desktop:test": "npm --workspace @jarvis/desktop run test"
+  },
+  "engines": {
+    "node": ">=20.0.0",
+    "npm": ">=10.0.0"
+  }
+}

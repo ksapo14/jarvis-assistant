@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://jarvis.local/schemas/activity.schema.json",
+  "title": "Redacted activity API record",
+  "type": "object",
+  "required": [
+    "id",
+    "command_id",
+    "created_at",
+    "user_request",
+    "assistant_response",
+    "status"
+  ],
+  "properties": {
+    "id": { "type": "integer" },
+    "command_id": { "type": "string", "format": "uuid" },
+    "created_at": { "type": "string", "format": "date-time" },
+    "user_request": { "type": "string" },
+    "assistant_response": { "type": "string" },
+    "tool_name": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,63}$" },
+    "tool_arguments": { "type": "object" },
+    "tool_result": { "type": "object" },
+    "risk_level": { "type": "string", "enum": ["low", "medium", "high"] },
+    "confirmation_result": {
+      "type": ["string", "null"],
+      "enum": ["approved", "denied", "expired", "cancelled", null]
+    },
+    "status": { "type": "string", "enum": ["success", "denied", "error", "cancelled"] }
+  },
+  "additionalProperties": false
+}

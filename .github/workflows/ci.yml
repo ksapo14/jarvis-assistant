@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Install backend
+        run: python -m pip install -e ".\services\assistant[dev,windows]"
+
+      - name: Install desktop
+        run: npm ci
+
+      - name: Ruff
+        run: python -m ruff check services/assistant/src services/assistant/tests
+
+      - name: Ruff formatting
+        run: python -m ruff format --check services/assistant/src services/assistant/tests
+
+      - name: Pytest
+        run: python -m pytest services/assistant/tests
+        env:
+          ASSISTANT_ENV: test
+          ASSISTANT_SESSION_TOKEN: ci-token-that-is-longer-than-thirty-two-characters
+
+      - name: Desktop lint
+        run: npm run desktop:lint
+
+      - name: Desktop formatting
+        run: npm --workspace "@jarvis/desktop" run format
+
+      - name: Desktop tests
+        run: npm run desktop:test
+
+      - name: Desktop production build
+        run: npm run desktop:build
+
+      - name: Rust formatting
+        run: cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml -- --check
+
+      - name: Tauri host check
+        run: cargo check --locked --manifest-path apps/desktop/src-tauri/Cargo.toml
+
+      - name: Tauri host tests
+        run: cargo test --locked --manifest-path apps/desktop/src-tauri/Cargo.toml

@@ -1,0 +1,6 @@
+{
+  "environment": "development",
+  "log_level": "DEBUG",
+  "mock_mode": true,
+  "notes": "Use ASSISTANT_MOCK_MODE=true; environment variables remain the source of runtime configuration."
+}
